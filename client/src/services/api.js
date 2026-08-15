@@ -38,6 +38,14 @@ async function request(path, { method = 'GET', body, signal, isFormData = false 
   return payload;
 }
 
+/** Booleans and numbers both need to survive the trip as query strings. */
+const toQuery = (params) =>
+  Object.fromEntries(
+    Object.entries(params)
+      .filter(([, value]) => value !== undefined && value !== null && value !== '')
+      .map(([key, value]) => [key, String(value)]),
+  );
+
 export const api = {
   health: (signal) => request('/health', { signal }),
 
@@ -69,12 +77,11 @@ export const api = {
     return request('/waste/classify', { method: 'POST', body: form, isFormData: true });
   },
 
-  /** Deterministic collection route - no AI, so it loads instantly. */
-  optimizeRoute: (fillThreshold = 70, signal) =>
-    request(`/routes/optimize?fillThreshold=${fillThreshold}`, { signal }),
-  /** The same route plus Gemini's dispatch briefing. */
-  analyseRoute: (fillThreshold = 70) =>
-    request('/routes/analyze', { method: 'POST', body: { fillThreshold } }),
+  /** Deterministic collection route - no AI, so it re-solves instantly. */
+  optimizeRoute: (params = {}, signal) =>
+    request(`/routes/optimize?${new URLSearchParams(toQuery(params))}`, { signal }),
+  /** The same route plus Gemini's dispatch briefing. Costs an AI call. */
+  analyseRoute: (params = {}) => request('/routes/analyze', { method: 'POST', body: params }),
 
   analyse: ({ binId, days = 30 } = {}) => request('/ai/analyze', { method: 'POST', body: { binId, days } }),
   recommendations: (binId, days = 30, signal) =>

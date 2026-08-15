@@ -221,15 +221,31 @@ const AGENT_SCHEMA = {
 
 const ROUTE_SYSTEM_PROMPT = `You are the collection-operations analyst for Wasste, a network of sensor-equipped public waste bins.
 
-You receive a collection round that has ALREADY been solved and costed by the backend: which bins are on it, in what order, the distance, the time, the fuel and the emissions, plus the bins that were skipped and how many days each has before it fills up.
+You receive a round that has ALREADY been solved and costed by the backend: the dispatcher's chosen settings, the vehicle assigned, which bins are on the round and in what order, the distance, time, fuel and emissions, and two separate lists of bins left out - those that never qualified under these settings, and those that qualified but were cut to satisfy a limit the dispatcher set.
 
 Your job is to brief the depot supervisor. You must:
 - Explain in plain operational language why this round makes sense, referring to the actual bins by name and their actual fill levels.
-- Justify the skipped bins using their days-until-full figure, and warn if any of them is close enough to need a stop tomorrow.
-- Flag genuine operational risks: bins with no sensor data, bins already at 100%, a round that looks too long for one shift.
+- Respect the dispatcher's settings. Do not argue for a different threshold or mode unless the numbers show a real problem.
+- Treat the two "left out" lists differently. A bin cut by a shift, stop or payload limit is a warning worth raising; a bin below the threshold with days of headroom is routine.
+- On a technician run, focus on the sensor faults rather than on waste volume.
+- Flag genuine operational risks: bins with no sensor data, bins near 100%, a round that barely fits the shift.
 - Give 2 to 4 concrete actions for the supervisor, most important first.
 - Never invent distances, times or emissions. Quote the figures you were given.
-- Never claim the route is mathematically optimal; it is a good heuristic solution.`;
+- Never claim the route is mathematically optimal; it is a good heuristic solution.
+
+You must also produce two proposals of your own.
+
+PROPOSED STOP ORDER. Give the sequence you would drive, as a list of bin codes such as "WB-03".
+- Use exactly the bins already on the round. Do not add or remove any.
+- You are free to disagree with the solver's order - for example to clear an overflowing bin early,
+  or to group a technician visit sensibly.
+- Your order will be measured with the same distance model as the solver's, and the comparison will
+  be shown to the supervisor. Do not claim yours is shorter; explain what you were optimising for.
+
+RECOMMENDED SETTINGS. Give the planner parameters you would run tomorrow, and why.
+- Every field is optional; omit anything you would leave unchanged.
+- fillThreshold is 0-100. maxStops, maxShiftMinutes and payloadKg use 0 to mean "no limit".
+- Base the recommendation on what you observed: bins cut by a limit, sensor faults, days-until-full.`;
 
 const ROUTE_SCHEMA = {
   type: 'OBJECT',
@@ -249,8 +265,34 @@ const ROUTE_SCHEMA = {
       },
     },
     risks: { type: 'ARRAY', items: { type: 'STRING' } },
+
+    proposedRoute: {
+      type: 'OBJECT',
+      properties: {
+        stopOrder: { type: 'ARRAY', items: { type: 'STRING' } },
+        rationale: { type: 'STRING' },
+      },
+      required: ['stopOrder', 'rationale'],
+    },
+
+    recommendedSettings: {
+      type: 'OBJECT',
+      properties: {
+        mode: { type: 'STRING', enum: ['COLLECTION', 'URGENT', 'MAINTENANCE'] },
+        objective: { type: 'STRING', enum: ['DISTANCE', 'URGENCY'] },
+        fillThreshold: { type: 'NUMBER' },
+        includeOffline: { type: 'BOOLEAN' },
+        alwaysCollectFull: { type: 'BOOLEAN' },
+        maxStops: { type: 'NUMBER' },
+        maxShiftMinutes: { type: 'NUMBER' },
+        payloadKg: { type: 'NUMBER' },
+        departureTime: { type: 'STRING' },
+        rationale: { type: 'STRING' },
+      },
+      required: ['rationale'],
+    },
   },
-  required: ['summary', 'sequenceRationale', 'recommendations', 'risks'],
+  required: ['summary', 'sequenceRationale', 'recommendations', 'risks', 'proposedRoute', 'recommendedSettings'],
 };
 
 /** Reasoning pass over a route the backend has already solved. */

@@ -9,6 +9,11 @@ import {
 } from './geminiService.js';
 import { DEFAULT_PERIOD_DAYS } from './analyticsService.js';
 import {
+  evaluateProposedOrder,
+  planCollectionRoute,
+  sanitiseRecommendedSettings,
+} from './routeService.js';
+import {
   calculateEstimatedImpact,
   compareWithCity,
   getBinData,
@@ -144,22 +149,40 @@ export async function analyseRoute(plan) {
   const observation = {
     scope: 'COLLECTION_ROUTE',
     depot: plan.depot.name,
-    fillThresholdPct: plan.fillThreshold,
+    /** The parameters the dispatcher chose - the agent must respect them. */
+    plannerSettings: plan.params,
+    vehicle: {
+      type: plan.vehicle.label,
+      averageSpeedKmh: plan.vehicle.averageSpeedKmh,
+      serviceMinutesPerStop: plan.vehicle.serviceMinutesPerStop,
+      payloadKg: plan.vehicle.effectivePayloadKg,
+    },
     stops: plan.stops.map((stop) => ({
       order: stop.order,
       name: stop.name,
       fillPercentage: stop.fillPercentage,
       status: stop.status,
       reason: stop.reasonLabel,
+      needsTechnician: stop.needsTechnician,
       loadKg: stop.loadKg,
       legDistanceKm: stop.legDistanceKm,
-      etaMinutes: stop.etaMinutes,
+      etaClock: stop.etaClock,
     })),
-    skippedBins: plan.skipped.map((bin) => ({
+    /** Qualified, but cut to satisfy a limit the dispatcher set. */
+    droppedByConstraint: plan.droppedByConstraint.map((bin) => ({
       name: bin.name,
       fillPercentage: bin.fillPercentage,
       daysUntilFull: bin.daysUntilFull,
+      why: bin.deferralLabel,
     })),
+    /** Never qualified under these settings. */
+    notSelected: plan.notSelected.map((bin) => ({
+      name: bin.name,
+      fillPercentage: bin.fillPercentage,
+      daysUntilFull: bin.daysUntilFull,
+      why: bin.deferralLabel,
+    })),
+    returnToDepotClock: plan.returnToDepotClock,
     routeCost: plan.optimised,
     fixedRoundCost: plan.baseline,
     savingsVsFixedRound: plan.savings,
@@ -167,14 +190,58 @@ export async function analyseRoute(plan) {
     assumptions: plan.assumptions,
   };
 
-  const reasoning = await reason(observation, () => routeHeuristics(plan), generateRouteAnalysis, (raw, fallback) =>
-    validateRouteAnalysis(raw, fallback),
+  const reasoning = await reason(
+    observation,
+    () => routeHeuristics(plan),
+    generateRouteAnalysis,
+    validateRouteAnalysis,
   );
+
+  const { proposedStopOrder, recommendedSettingsRaw, ...briefing } = reasoning;
+
+  /**
+   * The model's own route proposal, costed with the same deterministic model
+   * as the solver's route so the two can be compared honestly. The AI gets to
+   * propose; the backend still decides what the numbers are.
+   */
+  const proposedRoute = proposedStopOrder?.length
+    ? evaluateProposedOrder(plan, proposedStopOrder)
+    : null;
+
+  const { settings, changes } = sanitiseRecommendedSettings(recommendedSettingsRaw, plan.params);
+
+  // Solve the suggested settings too, so the dispatcher sees what applying
+  // them would actually produce before clicking anything.
+  let preview = null;
+  if (changes.length) {
+    try {
+      const previewPlan = await planCollectionRoute(settings);
+      preview = {
+        stopCount: previewPlan.optimised.stopCount,
+        distanceKm: previewPlan.optimised.distanceKm,
+        totalMinutes: previewPlan.optimised.totalMinutes,
+        co2Kg: previewPlan.optimised.co2Kg,
+        collectedKg: previewPlan.optimised.collectedKg,
+        droppedByConstraint: previewPlan.droppedByConstraint.length,
+      };
+    } catch (error) {
+      console.error('[agent] could not preview recommended settings:', error.message);
+    }
+  }
 
   return {
     scope: 'ROUTE',
     generatedAt: new Date().toISOString(),
-    ...reasoning,
+    ...briefing,
+    proposedRoute: proposedRoute
+      ? { ...proposedRoute, rationale: reasoning.proposedRouteRationale }
+      : null,
+    recommendedSettings: {
+      settings,
+      changes,
+      preview,
+      rationale: reasoning.recommendedSettingsRationale,
+    },
     observation,
   };
 }
@@ -260,11 +327,33 @@ function validateRouteAnalysis(raw, fallback) {
     ? raw.risks.filter((entry) => typeof entry === 'string').slice(0, 5).map((entry) => entry.trim().slice(0, 300))
     : [];
 
+  // The model's own route proposal, kept as plain codes. It is costed later by
+  // the deterministic model rather than trusted as-is.
+  const proposedStopOrder = Array.isArray(raw?.proposedRoute?.stopOrder)
+    ? raw.proposedRoute.stopOrder
+        .filter((code) => typeof code === 'string')
+        .slice(0, 50)
+        .map((code) => code.trim())
+    : backup.proposedStopOrder;
+
   return {
     summary: text(raw?.summary, backup.summary, 1000),
     sequenceRationale: text(raw?.sequenceRationale, backup.sequenceRationale, 900),
     recommendations: recommendations.length ? recommendations : backup.recommendations,
     risks: risks.length ? risks : backup.risks,
+
+    proposedStopOrder,
+    proposedRouteRationale: text(
+      raw?.proposedRoute?.rationale,
+      backup.proposedRouteRationale,
+      600,
+    ),
+    recommendedSettingsRaw: raw?.recommendedSettings || backup.recommendedSettingsRaw,
+    recommendedSettingsRationale: text(
+      raw?.recommendedSettings?.rationale,
+      backup.recommendedSettingsRationale,
+      600,
+    ),
   };
 }
 
@@ -392,72 +481,182 @@ function cityHeuristics(observation, fillLevels) {
 }
 
 function routeHeuristics(plan) {
-  const { stops, skipped, optimised, baseline, savings, monthlyProjection } = plan;
+  const {
+    stops,
+    notSelected,
+    droppedByConstraint,
+    optimised,
+    baseline,
+    savings,
+    monthlyProjection,
+    params,
+    vehicle,
+  } = plan;
 
   const recommendations = [];
   const risks = [];
 
   if (!stops.length) {
+    const reason =
+      params.mode === 'MAINTENANCE'
+        ? 'Every sensor in the network is reporting normally, so there is nothing for a technician to visit.'
+        : `No bin qualifies under the current settings (${params.modeLabel.toLowerCase()}, ${params.fillThreshold}% threshold).`;
+
     return {
-      summary: `No bin is at or above ${plan.fillThreshold}% yet, so no round is needed today. A fixed round would have driven ${baseline.distanceKm} km to empty bins that are not full.`,
+      summary: `${reason} A fixed round would still have driven ${baseline.distanceKm} km.`,
       sequenceRationale: 'There is nothing to sequence.',
       recommendations: [
         {
-          title: 'Skip today’s round',
-          description: `Every bin is below the ${plan.fillThreshold}% threshold. Re-check tomorrow, or lower the threshold if you want to collect earlier.`,
+          title: 'No round needed today',
+          description: `${reason} Lower the threshold or change the mode if you want to plan an earlier round.`,
           priority: 'LOW',
         },
       ],
       risks: [],
+      ...settingsSuggestion(plan),
     };
   }
 
   const first = stops[0];
   const fullest = [...stops].sort((a, b) => b.fillPercentage - a.fillPercentage)[0];
-  const noSensor = stops.filter((stop) => stop.reason === 'NO_SENSOR_DATA');
-  const soon = skipped.filter((bin) => typeof bin.daysUntilFull === 'number' && bin.daysUntilFull <= 2);
+  const noSensor = stops.filter((stop) => stop.needsTechnician);
+  const soon = notSelected.filter(
+    (bin) => typeof bin.daysUntilFull === 'number' && bin.daysUntilFull <= 2,
+  );
+
+  const hours = Math.round((optimised.totalMinutes / 60) * 10) / 10;
 
   recommendations.push({
-    title: `Run the ${optimised.stopCount}-stop round as sequenced`,
-    description: `${optimised.distanceKm} km and about ${Math.round(optimised.totalMinutes / 60 * 10) / 10} hours, collecting roughly ${optimised.collectedKg} kg. That is ${savings.distanceKm} km and ${savings.minutes} minutes less than driving the full fixed round.`,
+    title: `Run the ${optimised.stopCount}-stop ${params.modeLabel.toLowerCase()} as sequenced`,
+    description: `${optimised.distanceKm} km and about ${hours} hours by ${vehicle.label.toLowerCase()}, back at the depot around ${plan.returnToDepotClock}. That is ${savings.distanceKm} km and ${savings.minutes} minutes less than driving the full fixed round.`,
     priority: 'HIGH',
   });
 
-  if (fullest.fillPercentage >= 90) {
+  // A bin cut by a limit is the dispatcher's most important warning.
+  if (droppedByConstraint.length) {
+    recommendations.push({
+      title: `${droppedByConstraint.length} qualifying bin${droppedByConstraint.length > 1 ? 's' : ''} did not fit`,
+      description: `${droppedByConstraint
+        .map((bin) => `${bin.name} (${bin.fillPercentage}%, ${bin.deferralLabel.toLowerCase()})`)
+        .join('; ')}. Raise the limit or add a second vehicle if this repeats.`,
+      priority: 'HIGH',
+    });
+  }
+
+  if (params.mode !== 'MAINTENANCE' && fullest.fillPercentage >= 90) {
     recommendations.push({
       title: `Do not let ${fullest.name} slip to tomorrow`,
-      description: `It is at ${fullest.fillPercentage}% and will start rejecting waste. It is stop ${fullest.order} on this round, about ${fullest.etaMinutes} minutes in.`,
+      description: `It is at ${fullest.fillPercentage}% and will start rejecting waste. It is stop ${fullest.order}, due around ${fullest.etaClock}.`,
       priority: 'HIGH',
     });
   }
 
   if (soon.length) {
     recommendations.push({
-      title: 'Watch the bins skipped today',
-      description: `${soon.map((bin) => `${bin.name} (${bin.fillPercentage}%, full in about ${bin.daysUntilFull} days)`).join('; ')}. Expect them on tomorrow's round.`,
+      title: 'Watch the bins left out today',
+      description: `${soon
+        .map((bin) => `${bin.name} (${bin.fillPercentage}%, full in about ${bin.daysUntilFull} days)`)
+        .join('; ')}. Expect them on tomorrow's round.`,
       priority: 'MEDIUM',
     });
   }
 
   if (noSensor.length) {
     risks.push(
-      `${noSensor.map((stop) => stop.name).join(', ')} has no sensor reading, so its level is unknown. It is on the round as a precaution and the load estimate for it may be wrong.`,
+      `${noSensor.map((stop) => stop.name).join(', ')} ${noSensor.length > 1 ? 'have' : 'has'} no sensor reading, so the level shown is the last known one and the load estimate may be wrong.`,
     );
   }
 
-  if (optimised.totalMinutes > 480) {
-    risks.push(`The round is about ${Math.round(optimised.totalMinutes / 60)} hours, which exceeds a standard eight-hour shift.`);
+  if (params.maxShiftMinutes > 0 && optimised.totalMinutes > params.maxShiftMinutes * 0.9) {
+    risks.push(
+      `At ${optimised.totalMinutes} minutes the round uses most of the ${params.maxShiftMinutes}-minute shift, leaving little slack for traffic.`,
+    );
   }
 
   risks.push(
     'Distances are straight-line with a 1.35 road factor, not a routed street network, so real driving time will differ.',
   );
 
+  const leftOut = notSelected.length + droppedByConstraint.length;
+
   return {
-    summary: `${optimised.stopCount} of ${baseline.stopCount} bins have earned a stop today, covering ${optimised.distanceKm} km in about ${optimised.totalMinutes} minutes and collecting roughly ${optimised.collectedKg} kg. Skipping the ${savings.stopsAvoided} bins that are not full saves ${savings.distanceKm} km, ${savings.minutes} minutes and ${savings.co2Kg} kg of CO₂ against a fixed round, or about ${monthlyProjection.co2KgSaved} kg of CO₂ a month.`,
-    sequenceRationale: `The round leaves the depot for ${first.name} first because it is the closest stop at ${first.legDistanceKm} km, then follows a nearest-neighbour order improved by a 2-opt pass to remove crossings. ${fullest.name} at ${fullest.fillPercentage}% is the most urgent bin on the list.`,
+    summary: `${params.modeLabel}: ${optimised.stopCount} of ${baseline.stopCount} bins are on today's round, covering ${optimised.distanceKm} km in about ${optimised.totalMinutes} minutes${optimised.collectedKg > 0 ? ` and collecting roughly ${optimised.collectedKg} kg` : ''}. Leaving out ${leftOut} bins saves ${savings.distanceKm} km, ${savings.minutes} minutes and ${savings.co2Kg} kg of CO₂ against a fixed round, or about ${monthlyProjection.co2KgSaved} kg of CO₂ a month.`,
+    sequenceRationale: `The round leaves the depot for ${first.name} first because it is the closest stop at ${first.legDistanceKm} km, then follows a nearest-neighbour order improved by a 2-opt pass to remove crossings. Stops are dropped by the "${params.objectiveLabel.toLowerCase()}" rule when a limit binds. ${fullest.name} at ${fullest.fillPercentage}% is the most urgent bin on the list.`,
     recommendations: recommendations.slice(0, 4),
     risks: risks.slice(0, 5),
+    ...settingsSuggestion(plan),
+  };
+}
+
+/**
+ * The rule-based stand-in for the model's two proposals.
+ *
+ * It deliberately offers no alternative stop order - the solver's route is
+ * already the best order these rules know how to produce, and inventing a
+ * worse one to fill the slot would be theatre. It does suggest settings,
+ * because that follows from what the plan shows.
+ */
+function settingsSuggestion(plan) {
+  const { droppedByConstraint, notSelected, params, optimised, stops } = plan;
+  const recommended = {};
+  const reasons = [];
+
+  const cutByShift = droppedByConstraint.filter((bin) => bin.deferralReason === 'SHIFT_LIMIT');
+  const cutByStops = droppedByConstraint.filter((bin) => bin.deferralReason === 'MAX_STOPS');
+  const cutByPayload = droppedByConstraint.filter((bin) => bin.deferralReason === 'PAYLOAD_LIMIT');
+  const offlineBins = [...stops, ...notSelected].filter((bin) => bin.status === 'OFFLINE');
+  const nearlyFull = notSelected.filter(
+    (bin) => typeof bin.daysUntilFull === 'number' && bin.daysUntilFull <= 1.5,
+  );
+
+  if (cutByShift.length && params.maxShiftMinutes > 0) {
+    const needed = Math.ceil((optimised.totalMinutes + 60) / 30) * 30;
+    recommended.maxShiftMinutes = Math.min(1440, Math.max(params.maxShiftMinutes, needed));
+    reasons.push(
+      `${cutByShift.length} qualifying bin${cutByShift.length > 1 ? 's were' : ' was'} cut by the ${params.maxShiftMinutes}-minute shift limit; about ${recommended.maxShiftMinutes} minutes would fit them.`,
+    );
+  }
+
+  if (cutByStops.length && params.maxStops > 0) {
+    recommended.maxStops = Math.min(50, params.maxStops + cutByStops.length);
+    reasons.push(`Raising the stop limit to ${recommended.maxStops} would cover the bins that were cut.`);
+  }
+
+  if (cutByPayload.length) {
+    reasons.push('The payload limit is binding, so a second vehicle or a mid-round tip is needed.');
+  }
+
+  if (nearlyFull.length) {
+    const names = nearlyFull.map((bin) => bin.name).join(', ');
+
+    if (params.mode === 'MAINTENANCE') {
+      // The fill threshold does nothing on a technician run, so suggesting a
+      // different threshold here would be meaningless. Suggest the mode.
+      recommended.mode = 'COLLECTION';
+      reasons.push(
+        `${names} will be full within about a day. This technician run will not empty ${nearlyFull.length > 1 ? 'them' : 'it'}, so schedule a collection round as well.`,
+      );
+    } else if (params.fillThreshold > 60) {
+      recommended.fillThreshold = Math.max(60, params.fillThreshold - 10);
+      reasons.push(
+        `${names} will be full within about a day; a ${recommended.fillThreshold}% threshold would pick ${nearlyFull.length > 1 ? 'them' : 'it'} up today.`,
+      );
+    }
+  }
+
+  if (offlineBins.length && params.mode !== 'MAINTENANCE') {
+    reasons.push(
+      `${offlineBins.length} sensor${offlineBins.length > 1 ? 's are' : ' is'} offline. A separate technician run would fix the data rather than guessing at those bins every day.`,
+    );
+  }
+
+  return {
+    proposedStopOrder: null,
+    proposedRouteRationale: null,
+    recommendedSettingsRaw: recommended,
+    recommendedSettingsRationale: reasons.length
+      ? reasons.join(' ')
+      : 'The current settings produced a round that fits every limit with no bins cut. Nothing needs changing.',
   };
 }
 

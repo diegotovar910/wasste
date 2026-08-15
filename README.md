@@ -40,7 +40,7 @@ RECOGNISE → CLASSIFY → COLLECT DATA → ANALYSE → IDENTIFY OPPORTUNITIES �
 |---|---|---|
 | City overview | `/` | Network-wide metrics, waste trend, distribution, schematic bin map, collection queue, city-level AI analysis, all bins |
 | Waste scanner | `/scan` | Upload or photograph an item, classify it with Gemini Vision, record it against a bin |
-| Collection route | `/routes` | Today's optimised round built from live fill levels, with time, fuel and CO₂ saved against a fixed round, plus an AI dispatch briefing |
+| Route planner | `/routes` | A parameterised planner: pick the round type, the fill threshold and the operating limits, and it solves the route, costs it, and briefs the crew |
 | Analytics | `/analytics` | Waste over time, waste by category, distribution, bin fill levels, landfill diversion, top locations, data table |
 | Bin detail | `/bins/:id` | One bin's fill level, sensors, distribution, history, recent items, and its own AI recommendations |
 
@@ -239,20 +239,50 @@ REASON      the resulting briefing goes to Gemini with a schema-constrained prom
 RECOMMEND   summary, key finding, 2–4 prioritised actions, resource-recovery opportunities
 ```
 
-### 3. Route optimisation — solve, then explain
+### 3. Route planning — solve, then explain
 
-`server/src/services/routeService.js` contains no AI at all. It selects the bins that have earned a
-stop, orders them with **nearest-neighbour plus a 2-opt improvement pass** (which untangles the
-crossings a greedy route leaves behind), and costs the round: distance, drive time, servicing time,
-diesel and CO₂. The saving is measured against the status quo it replaces — a fixed round that
-drives to every bin regardless of how full it is.
+`server/src/services/routeService.js` contains no AI at all. Given the dispatcher's parameters it:
 
-Only then does Gemini see the finished plan, and its job is to brief the depot supervisor: why this
-sequence, why those bins were skipped (justified by each one's days-until-full), and what the crew
-should watch for. It is explicitly told never to invent a distance or an emission figure.
+1. **Selects** the bins that qualify, recording a reason for every inclusion and exclusion.
+2. **Sequences** them with **nearest-neighbour plus a 2-opt improvement pass**, which untangles the
+   crossings a greedy route always leaves behind.
+3. **Costs** the round — distance, drive time, servicing, fuel, CO₂ and running cost — using the
+   vehicle assigned to that mode. A technician van is slower to service (20 min per bin, because
+   diagnosing a sensor is not tipping a bin) but far cheaper to drive than a refuse truck.
+4. **Trims** the round until it fits the stop, shift and payload limits, re-solving after each cut.
+   Which stop gets sacrificed is the `objective` parameter's job: `URGENCY` protects the fullest
+   bins, while `DISTANCE` drops whichever stop buys the least urgency per kilometre of detour.
 
-A bin at 90% or above is always collected, whatever the threshold — it is about to overflow. So is a
-bin whose sensor is offline, because its real level is unknown and a truck has to go and look.
+Bins left out are reported in two separate lists, because they mean different things: one for bins
+that never qualified (routine), one for bins that qualified but **were cut by a limit** — which is a
+warning the supervisor needs to see.
+
+Only then does Gemini see the finished plan. It briefs the depot supervisor — why this sequence, why
+those bins were left out, what the crew should watch for — and it makes **two proposals of its own**:
+
+**Its own stop order.** The agent may reorder the round (to clear an overflowing bin early, say, or
+to group a technician visit sensibly). It cannot add or remove bins, because that would change what
+is being compared. Its sequence is then costed with the *same* distance model as the solver's, and
+the comparison is shown plainly: "the planner's route is 6.1 km shorter" is a normal, honest
+outcome. The AI proposes; the arithmetic still decides.
+
+**The settings it would run next.** A parameter set, with a rationale drawn from what it observed —
+bins cut by a limit, sensor faults, days-until-full. The backend sanitises it (out-of-range values
+clamped, unknown enums dropped, bad types ignored — a proposal from the model can never produce an
+illegal parameter set), *solves the suggested settings* so the dispatcher sees what they would
+actually produce, and offers one button to adopt them.
+
+`npm run check:proposals` exercises this whole path with fabricated model responses — malformed,
+incomplete, duplicated and hostile — without spending an API call.
+
+Without a key, the rule-based fallback still recommends settings (it will tell you to raise a shift
+limit that cut a bin, or to schedule a technician run). It deliberately proposes **no** alternative
+stop order: the solver's route is already the best order those rules know how to produce, and
+inventing a worse one just to fill the slot would be theatre.
+
+A bin at 90% or above is collected whatever the threshold — it is about to overflow. So is a bin
+whose sensor is offline, because its real level is unknown and someone has to go and look. Both
+behaviours are switchable.
 
 ### The division of labour
 
@@ -318,8 +348,28 @@ Base URL `http://localhost:5000/api`.
 
 | Method | Path | Description |
 |---|---|---|
-| `GET` | `/routes/optimize?fillThreshold=70` | Solved collection round. No AI, so it returns instantly |
+| `GET` | `/routes/optimize` | Solved round. No AI, so it returns in milliseconds |
 | `POST` | `/routes/analyze` | The same plan plus Gemini's dispatch briefing |
+
+Both accept the same planner parameters — as a query string on `GET`, as a JSON body on `POST`.
+All are validated and every rejection names the offending field.
+
+| Parameter | Default | Values |
+|---|---|---|
+| `mode` | `COLLECTION` | `COLLECTION` · `URGENT` (overflow risk only) · `MAINTENANCE` (technician van, sensor faults only) |
+| `fillThreshold` | `70` | 0–100. Bins at or above this earn a stop |
+| `includeOffline` | `true` | Visit bins whose sensors stopped reporting |
+| `alwaysCollectFull` | `true` | Bins at 90%+ override the threshold |
+| `maxStops` | `0` | 0–50. `0` means no limit |
+| `maxShiftMinutes` | `480` | 0–1440. `0` means no limit |
+| `payloadKg` | `0` | 0–20000. `0` uses the vehicle's own capacity |
+| `objective` | `DISTANCE` | Which stop to drop when a limit binds: `DISTANCE` or `URGENCY` |
+| `departureTime` | `07:00` | 24-hour `HH:MM`, used for arrival clocks |
+
+```bash
+curl "http://localhost:5000/api/routes/optimize?mode=MAINTENANCE"
+curl "http://localhost:5000/api/routes/optimize?fillThreshold=80&maxShiftMinutes=240&objective=URGENCY"
+```
 
 ### AI
 

@@ -9,7 +9,8 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "seed": "node src/seed/seed.js",
-    "db:inspect": "node scripts/db-inspect.js"
+    "db:inspect": "node scripts/db-inspect.js",
+    "check:proposals": "node scripts/check-ai-proposals.js"
   },
   "dependencies": {
     "cors": "^2.8.5",

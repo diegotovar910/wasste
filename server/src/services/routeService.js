@@ -1,14 +1,24 @@
 import { SmartBin } from '../models/SmartBin.js';
-import { DEFAULT_FILL_THRESHOLD, DEPOT, FLEET_ASSUMPTIONS, STOP_REASONS } from '../config/fleet.js';
+import {
+  DEFERRAL_REASONS,
+  DEPOT,
+  FLEET_ASSUMPTIONS,
+  OBJECTIVES,
+  OFFLINE_URGENCY,
+  ROUTE_DEFAULTS,
+  ROUTE_MODES,
+  STOP_REASONS,
+  VEHICLES,
+} from '../config/fleet.js';
 import { round, sumDistribution } from '../utils/impact.js';
 import { DEFAULT_PERIOD_DAYS } from './analyticsService.js';
 
 /**
- * Collection route optimisation.
+ * Collection route planner.
  *
- * This file contains no AI at all. The route, the distances, the times and the
- * emissions are solved deterministically here; Gemini only reads the finished
- * plan and explains it (section 18's rule applied to operations).
+ * There is no AI in this file. Bin selection, sequencing, the constraint
+ * trade-offs and every cost figure are solved deterministically here; Gemini
+ * only reads the finished plan and explains it.
  */
 
 const EARTH_RADIUS_KM = 6371;
@@ -21,13 +31,11 @@ export function haversineKm(a, b) {
   const lat1 = toRadians(a.latitude);
   const lat2 = toRadians(b.latitude);
 
-  const h =
-    Math.sin(dLat / 2) ** 2 + Math.sin(dLng / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
-
+  const h = Math.sin(dLat / 2) ** 2 + Math.sin(dLng / 2) ** 2 * Math.cos(lat1) * Math.cos(lat2);
   return 2 * EARTH_RADIUS_KM * Math.asin(Math.sqrt(h));
 }
 
-/** Straight-line distance scaled to something a truck could actually drive. */
+/** Straight-line distance scaled to something a vehicle could actually drive. */
 const roadKm = (a, b) => haversineKm(a, b) * FLEET_ASSUMPTIONS.roadDistanceFactor;
 
 /** Total length of depot -> stops in order -> depot. */
@@ -70,7 +78,6 @@ function nearestNeighbour(stops) {
 /**
  * 2-opt improvement: repeatedly reverse a segment when doing so shortens the
  * round. Greedy routes often cross over themselves; this untangles them.
- * O(n^2) per pass, which is nothing at city-pilot scale.
  */
 function twoOpt(stops) {
   if (stops.length < 4) return stops;
@@ -105,21 +112,17 @@ function twoOpt(stops) {
   return best;
 }
 
-/** Turns an ordered list of stops into distance, time, fuel and emissions. */
-function costOfRoute(stops) {
+const solve = (stops) => twoOpt(nearestNeighbour(stops));
+
+/** Turns an ordered list of stops into distance, time, fuel, cost and emissions. */
+function costOfRoute(stops, vehicle) {
   const distanceKm = routeDistanceKm(stops);
-  const {
-    averageSpeedKmh,
-    serviceMinutesPerStop,
-    fuelLitresPerKm,
-    idleFuelLitresPerMinute,
-    co2KgPerLitreDiesel,
-  } = FLEET_ASSUMPTIONS;
+  const { co2KgPerLitreDiesel, fuelCostPerLitre } = FLEET_ASSUMPTIONS;
 
-  const driveMinutes = averageSpeedKmh > 0 ? (distanceKm / averageSpeedKmh) * 60 : 0;
-  const serviceMinutes = stops.length * serviceMinutesPerStop;
-
-  const fuelLitres = distanceKm * fuelLitresPerKm + serviceMinutes * idleFuelLitresPerMinute;
+  const driveMinutes = vehicle.averageSpeedKmh > 0 ? (distanceKm / vehicle.averageSpeedKmh) * 60 : 0;
+  const serviceMinutes = stops.length * vehicle.serviceMinutesPerStop;
+  const fuelLitres =
+    distanceKm * vehicle.fuelLitresPerKm + serviceMinutes * vehicle.idleFuelLitresPerMinute;
 
   return {
     stopCount: stops.length,
@@ -129,6 +132,7 @@ function costOfRoute(stops) {
     totalMinutes: Math.round(driveMinutes + serviceMinutes),
     fuelLitres: round(fuelLitres, 2),
     co2Kg: round(fuelLitres * co2KgPerLitreDiesel, 2),
+    fuelCost: round(fuelLitres * fuelCostPerLitre, 2),
     collectedKg: round(stops.reduce((sum, stop) => sum + (stop.loadKg || 0), 0)),
   };
 }
@@ -143,24 +147,126 @@ function daysUntilFull(bin, periodDays) {
   return round(remainingKg / kgPerDay, 1);
 }
 
-function reasonFor(bin, fillThreshold) {
-  if (bin.status === 'OFFLINE') return 'NO_SENSOR_DATA';
-  if (bin.currentFillPercentage >= 90) return 'FULL';
-  if (bin.currentFillPercentage >= fillThreshold) return 'NEEDS_ATTENTION';
-  return null;
+/**
+ * Decides whether a bin belongs on this round, and why.
+ * Returns null when it does not qualify, with the reason recorded separately.
+ */
+function qualify(bin, { mode, fillThreshold, includeOffline, alwaysCollectFull }) {
+  const isOffline = bin.status === 'OFFLINE';
+  const fill = bin.currentFillPercentage;
+
+  if (mode === 'MAINTENANCE') {
+    return isOffline
+      ? { reason: 'NO_SENSOR_DATA', urgency: OFFLINE_URGENCY }
+      : { deferred: 'SENSOR_ONLINE' };
+  }
+
+  if (isOffline) {
+    return includeOffline
+      ? { reason: 'NO_SENSOR_DATA', urgency: OFFLINE_URGENCY }
+      : { deferred: 'SENSOR_ONLINE' };
+  }
+
+  if (mode === 'URGENT') {
+    return fill >= 90 ? { reason: 'FULL', urgency: fill } : { deferred: 'NOT_URGENT' };
+  }
+
+  // Standard collection round.
+  if (alwaysCollectFull && fill >= 90) return { reason: 'FULL', urgency: fill };
+  if (fill >= fillThreshold) {
+    return { reason: fill >= 90 ? 'FULL' : 'NEEDS_ATTENTION', urgency: fill };
+  }
+
+  return { deferred: 'BELOW_THRESHOLD' };
 }
 
 /**
- * Builds today's collection round.
- *
- * The optimised route visits only bins that have earned a stop. The baseline
- * is the status quo it replaces: a fixed round that drives to every bin in the
- * network regardless of how full it is.
+ * Trims the candidate list until the round fits the shift, the stop limit and
+ * the payload. The stop that gets dropped is the least urgent one - or under
+ * the DISTANCE objective, the one whose detour buys the least urgency.
  */
-export async function planCollectionRoute({
-  fillThreshold = DEFAULT_FILL_THRESHOLD,
-  periodDays = DEFAULT_PERIOD_DAYS,
-} = {}) {
+function applyConstraints(candidates, vehicle, { maxStops, maxShiftMinutes, payloadKg, objective }) {
+  let kept = [...candidates];
+  const dropped = [];
+
+  const limitPayload = payloadKg > 0 ? payloadKg : vehicle.payloadKg;
+
+  const violation = (route, cost) => {
+    if (maxStops > 0 && route.length > maxStops) return 'MAX_STOPS';
+    if (maxShiftMinutes > 0 && cost.totalMinutes > maxShiftMinutes) return 'SHIFT_LIMIT';
+    if (limitPayload > 0 && cost.collectedKg > limitPayload) return 'PAYLOAD_LIMIT';
+    return null;
+  };
+
+  // Re-solve after each drop: removing a stop changes the best sequence.
+  let ordered = solve(kept);
+  let cost = costOfRoute(ordered, vehicle);
+  let guard = 0;
+
+  while (kept.length && guard < 100) {
+    const reason = violation(ordered, cost);
+    if (!reason) break;
+    guard += 1;
+
+    const victim = chooseDropCandidate(ordered, objective);
+    kept = kept.filter((stop) => stop.binId !== victim.binId);
+    dropped.push({ ...victim, deferralReason: reason });
+
+    ordered = solve(kept);
+    cost = costOfRoute(ordered, vehicle);
+  }
+
+  return { ordered, cost, dropped };
+}
+
+/**
+ * Picks the stop to sacrifice.
+ *
+ * URGENCY keeps the fullest bins no matter the detour. DISTANCE weighs each
+ * stop's detour cost against its urgency, so a nearly-empty bin at the far end
+ * of the city goes first.
+ */
+function chooseDropCandidate(ordered, objective) {
+  if (objective === OBJECTIVES.URGENCY.id) {
+    return [...ordered].sort((a, b) => a.urgency - b.urgency)[0];
+  }
+
+  const baseline = routeDistanceKm(ordered);
+
+  const scored = ordered.map((stop) => {
+    const without = routeDistanceKm(ordered.filter((other) => other.binId !== stop.binId));
+    const detourKm = Math.max(0.01, baseline - without);
+    // High detour and low urgency = the worst value on the round.
+    return { stop, value: stop.urgency / detourKm };
+  });
+
+  return scored.sort((a, b) => a.value - b.value)[0].stop;
+}
+
+/** "07:00" + 43 minutes -> "07:43". */
+function clockTime(departureTime, minutesFromStart) {
+  const [hours, minutes] = String(departureTime).split(':').map(Number);
+  if (!Number.isFinite(hours) || !Number.isFinite(minutes)) return null;
+
+  const total = hours * 60 + minutes + minutesFromStart;
+  const wrapped = ((total % 1440) + 1440) % 1440;
+  return `${String(Math.floor(wrapped / 60)).padStart(2, '0')}:${String(wrapped % 60).padStart(2, '0')}`;
+}
+
+/**
+ * Builds a round from the supplied parameters.
+ *
+ * The baseline it is measured against is the status quo it replaces: a fixed
+ * round that visits every bin in the network with the same vehicle.
+ */
+export async function planCollectionRoute(options = {}) {
+  const params = { ...ROUTE_DEFAULTS, ...options };
+  const { periodDays = DEFAULT_PERIOD_DAYS } = options;
+
+  const mode = ROUTE_MODES[params.mode] ? params.mode : ROUTE_DEFAULTS.mode;
+  const objective = OBJECTIVES[params.objective] ? params.objective : ROUTE_DEFAULTS.objective;
+  const vehicle = VEHICLES[ROUTE_MODES[mode].vehicle];
+
   const bins = await SmartBin.find().sort({ code: 1 });
 
   const toStop = (bin) => ({
@@ -174,86 +280,125 @@ export async function planCollectionRoute({
     status: bin.status,
     loadKg: round(bin.sensors?.estimatedWeightKg || 0),
     capacityKg: bin.capacityKg,
+    lastReadingAt: bin.sensors?.lastReadingAt || null,
     daysUntilFull: daysUntilFull(bin, periodDays),
+    needsTechnician: bin.status === 'OFFLINE',
   });
 
   const candidates = [];
-  const skipped = [];
+  const notSelected = [];
 
   for (const bin of bins) {
-    const reason = reasonFor(bin, fillThreshold);
+    const verdict = qualify(bin, { ...params, mode });
     const stop = toStop(bin);
 
-    if (reason) {
-      candidates.push({ ...stop, reason, reasonLabel: STOP_REASONS[reason] });
+    if (verdict.deferred) {
+      notSelected.push({ ...stop, deferralReason: verdict.deferred });
     } else {
-      skipped.push(stop);
+      candidates.push({
+        ...stop,
+        reason: verdict.reason,
+        reasonLabel: STOP_REASONS[verdict.reason],
+        urgency: verdict.urgency,
+      });
     }
   }
 
-  // Solve, then measure. Both routes are costed with the same model so the
-  // comparison is apples to apples.
-  const ordered = twoOpt(nearestNeighbour(candidates));
-  const optimised = costOfRoute(ordered);
+  const { ordered, cost, dropped } = applyConstraints(candidates, vehicle, {
+    maxStops: params.maxStops,
+    maxShiftMinutes: params.maxShiftMinutes,
+    payloadKg: params.payloadKg,
+    objective,
+  });
 
   // The status quo: every bin, in the fixed order a printed round sheet lists.
-  const baselineStops = bins.map(toStop);
-  const baseline = costOfRoute(baselineStops);
+  const baseline = costOfRoute(bins.map(toStop), vehicle);
+  // The same selected stops in bin-code order, to show what the solver adds.
+  const unoptimisedSelected = costOfRoute(
+    candidates.filter((stop) => ordered.some((kept) => kept.binId === stop.binId)),
+    vehicle,
+  );
 
-  // The same stops in the order a greedy round sheet would take them, to show
-  // what the solver itself contributes on top of simply skipping bins.
-  const unoptimisedSelected = costOfRoute(candidates);
+  let cumulativeKm = 0;
+  let cumulativeMinutes = 0;
 
   const stops = ordered.map((stop, index) => {
     const previous = index === 0 ? DEPOT : ordered[index - 1];
     const legDistanceKm = round(roadKm(previous, stop), 2);
-    return { ...stop, order: index + 1, legDistanceKm };
+
+    cumulativeKm += legDistanceKm;
+    cumulativeMinutes +=
+      (legDistanceKm / vehicle.averageSpeedKmh) * 60 + vehicle.serviceMinutesPerStop;
+
+    return {
+      ...stop,
+      order: index + 1,
+      legDistanceKm,
+      cumulativeDistanceKm: round(cumulativeKm, 2),
+      etaMinutes: Math.round(cumulativeMinutes),
+      etaClock: clockTime(params.departureTime, Math.round(cumulativeMinutes)),
+    };
   });
 
-  let cumulativeKm = 0;
-  let cumulativeMinutes = 0;
-  for (const stop of stops) {
-    cumulativeKm += stop.legDistanceKm;
-    cumulativeMinutes +=
-      (stop.legDistanceKm / FLEET_ASSUMPTIONS.averageSpeedKmh) * 60 +
-      FLEET_ASSUMPTIONS.serviceMinutesPerStop;
-    stop.cumulativeDistanceKm = round(cumulativeKm, 2);
-    stop.etaMinutes = Math.round(cumulativeMinutes);
-  }
+  const returnMinutes = stops.length
+    ? Math.round(cumulativeMinutes + (roadKm(ordered[ordered.length - 1], DEPOT) / vehicle.averageSpeedKmh) * 60)
+    : 0;
 
   const savings = {
-    distanceKm: round(baseline.distanceKm - optimised.distanceKm, 2),
-    minutes: baseline.totalMinutes - optimised.totalMinutes,
-    fuelLitres: round(baseline.fuelLitres - optimised.fuelLitres, 2),
-    co2Kg: round(baseline.co2Kg - optimised.co2Kg, 2),
-    stopsAvoided: baseline.stopCount - optimised.stopCount,
-    percentDistance: baseline.distanceKm > 0
-      ? Math.round(((baseline.distanceKm - optimised.distanceKm) / baseline.distanceKm) * 100)
-      : 0,
-    percentTime: baseline.totalMinutes > 0
-      ? Math.round(((baseline.totalMinutes - optimised.totalMinutes) / baseline.totalMinutes) * 100)
-      : 0,
-    percentCo2: baseline.co2Kg > 0
-      ? Math.round(((baseline.co2Kg - optimised.co2Kg) / baseline.co2Kg) * 100)
-      : 0,
+    distanceKm: round(baseline.distanceKm - cost.distanceKm, 2),
+    minutes: baseline.totalMinutes - cost.totalMinutes,
+    fuelLitres: round(baseline.fuelLitres - cost.fuelLitres, 2),
+    co2Kg: round(baseline.co2Kg - cost.co2Kg, 2),
+    fuelCost: round(baseline.fuelCost - cost.fuelCost, 2),
+    stopsAvoided: baseline.stopCount - cost.stopCount,
+    percentDistance: percentSaved(baseline.distanceKm, cost.distanceKm),
+    percentTime: percentSaved(baseline.totalMinutes, cost.totalMinutes),
+    percentCo2: percentSaved(baseline.co2Kg, cost.co2Kg),
   };
 
   const { roundsPerMonth } = FLEET_ASSUMPTIONS;
 
   return {
     generatedAt: new Date().toISOString(),
-    fillThreshold,
+    params: {
+      mode,
+      modeLabel: ROUTE_MODES[mode].label,
+      modeDescription: ROUTE_MODES[mode].description,
+      objective,
+      objectiveLabel: OBJECTIVES[objective].label,
+      fillThreshold: params.fillThreshold,
+      includeOffline: params.includeOffline,
+      alwaysCollectFull: params.alwaysCollectFull,
+      maxStops: params.maxStops,
+      maxShiftMinutes: params.maxShiftMinutes,
+      payloadKg: params.payloadKg,
+      departureTime: params.departureTime,
+    },
+    vehicle: {
+      ...vehicle,
+      effectivePayloadKg: params.payloadKg > 0 ? params.payloadKg : vehicle.payloadKg,
+    },
     depot: DEPOT,
     stops,
-    skipped: skipped.sort((a, b) => b.fillPercentage - a.fillPercentage),
-    optimised,
+    /** Bins that qualified but were cut to satisfy a limit. */
+    droppedByConstraint: dropped.map((stop) => ({
+      ...stop,
+      deferralLabel: DEFERRAL_REASONS[stop.deferralReason],
+    })),
+    /** Bins that never qualified under these parameters. */
+    notSelected: notSelected
+      .map((stop) => ({ ...stop, deferralLabel: DEFERRAL_REASONS[stop.deferralReason] }))
+      .sort((a, b) => b.fillPercentage - a.fillPercentage),
+    technicianStops: stops.filter((stop) => stop.needsTechnician).length,
+    optimised: cost,
     baseline,
     unoptimisedSelected,
-    /** What the 2-opt solver saves beyond simply visiting fewer bins. */
     solverGain: {
-      distanceKm: round(unoptimisedSelected.distanceKm - optimised.distanceKm, 2),
-      minutes: unoptimisedSelected.totalMinutes - optimised.totalMinutes,
+      distanceKm: round(unoptimisedSelected.distanceKm - cost.distanceKm, 2),
+      minutes: unoptimisedSelected.totalMinutes - cost.totalMinutes,
     },
+    returnToDepotMinutes: returnMinutes,
+    returnToDepotClock: clockTime(params.departureTime, returnMinutes),
     savings,
     monthlyProjection: {
       roundsPerMonth,
@@ -261,7 +406,177 @@ export async function planCollectionRoute({
       co2KgSaved: round(savings.co2Kg * roundsPerMonth),
       fuelLitresSaved: round(savings.fuelLitres * roundsPerMonth),
       distanceKmSaved: round(savings.distanceKm * roundsPerMonth),
+      fuelCostSaved: round(savings.fuelCost * roundsPerMonth),
     },
     assumptions: FLEET_ASSUMPTIONS,
+    options: {
+      modes: Object.values(ROUTE_MODES),
+      objectives: Object.values(OBJECTIVES),
+      defaults: ROUTE_DEFAULTS,
+    },
   };
+}
+
+/**
+ * Costs a stop order somebody else proposed - in practice, Gemini's.
+ *
+ * The proposal is measured with exactly the same distance and cost model as
+ * the solver's own route, so the comparison is fair. The AI may reorder the
+ * round; it may not add or remove bins, because that would change what is
+ * being compared. Anything missing is appended in the solver's order and the
+ * result is flagged as repaired.
+ */
+export function evaluateProposedOrder(plan, proposedCodes = []) {
+  const byCode = new Map(plan.stops.map((stop) => [stop.code, stop]));
+
+  const seen = new Set();
+  const unknownCodes = [];
+  const ordered = [];
+
+  for (const rawCode of proposedCodes) {
+    const code = String(rawCode || '').trim().toUpperCase();
+    const stop = byCode.get(code);
+
+    if (!stop) {
+      if (code) unknownCodes.push(code);
+      continue;
+    }
+    if (seen.has(code)) continue;
+
+    seen.add(code);
+    ordered.push(stop);
+  }
+
+  // Anything the proposal forgot still has to be visited.
+  const missing = plan.stops.filter((stop) => !seen.has(stop.code));
+  const repaired = missing.length > 0 || unknownCodes.length > 0;
+  const finalOrder = [...ordered, ...missing];
+
+  if (!finalOrder.length) return null;
+
+  const vehicle = plan.vehicle;
+  const cost = costOfRoute(finalOrder, vehicle);
+
+  let cumulativeKm = 0;
+  let cumulativeMinutes = 0;
+
+  const stops = finalOrder.map((stop, index) => {
+    const previous = index === 0 ? DEPOT : finalOrder[index - 1];
+    const legDistanceKm = round(roadKm(previous, stop), 2);
+
+    cumulativeKm += legDistanceKm;
+    cumulativeMinutes +=
+      (legDistanceKm / vehicle.averageSpeedKmh) * 60 + vehicle.serviceMinutesPerStop;
+
+    return {
+      binId: stop.binId,
+      code: stop.code,
+      name: stop.name,
+      fillPercentage: stop.fillPercentage,
+      order: index + 1,
+      legDistanceKm,
+      cumulativeDistanceKm: round(cumulativeKm, 2),
+      etaClock: clockTime(plan.params.departureTime, Math.round(cumulativeMinutes)),
+    };
+  });
+
+  const distanceDeltaKm = round(cost.distanceKm - plan.optimised.distanceKm, 2);
+
+  return {
+    stops,
+    cost,
+    repaired,
+    unknownCodes,
+    missingCodes: missing.map((stop) => stop.code),
+    comparison: {
+      distanceDeltaKm,
+      minutesDelta: cost.totalMinutes - plan.optimised.totalMinutes,
+      co2DeltaKg: round(cost.co2Kg - plan.optimised.co2Kg, 2),
+      // A tie is genuinely common: a round trip measures the same in reverse.
+      verdict:
+        Math.abs(distanceDeltaKm) < 0.01
+          ? 'EQUAL'
+          : distanceDeltaKm < 0
+            ? 'AI_SHORTER'
+            : 'SOLVER_SHORTER',
+    },
+  };
+}
+
+const clamp = (value, min, max) => Math.min(max, Math.max(min, Math.round(value)));
+
+const SETTING_LABELS = {
+  mode: 'Round type',
+  objective: 'Drop rule',
+  fillThreshold: 'Fill threshold',
+  includeOffline: 'Visit offline sensors',
+  alwaysCollectFull: 'Always collect 90%+',
+  maxStops: 'Maximum stops',
+  maxShiftMinutes: 'Shift length',
+  payloadKg: 'Payload limit',
+  departureTime: 'Departure time',
+};
+
+/**
+ * Cleans up a settings proposal from the model.
+ *
+ * Unlike the API's own parameter parsing this never throws: a nonsense value
+ * from Gemini is dropped, not surfaced as a user-facing error. Anything the
+ * model omits keeps the dispatcher's current value.
+ */
+export function sanitiseRecommendedSettings(raw = {}, current = {}) {
+  const proposed = {};
+
+  const takeEnum = (key, allowed) => {
+    const value = String(raw?.[key] || '').toUpperCase();
+    if (allowed.includes(value)) proposed[key] = value;
+  };
+
+  const takeNumber = (key, min, max) => {
+    const value = Number(raw?.[key]);
+    if (Number.isFinite(value)) proposed[key] = clamp(value, min, max);
+  };
+
+  const takeBoolean = (key) => {
+    if (typeof raw?.[key] === 'boolean') proposed[key] = raw[key];
+  };
+
+  takeEnum('mode', Object.keys(ROUTE_MODES));
+  takeEnum('objective', Object.keys(OBJECTIVES));
+  takeNumber('fillThreshold', 0, 100);
+  takeNumber('maxStops', 0, 50);
+  takeNumber('maxShiftMinutes', 0, 1440);
+  takeNumber('payloadKg', 0, 20000);
+  takeBoolean('includeOffline');
+  takeBoolean('alwaysCollectFull');
+
+  if (/^([01]\d|2[0-3]):[0-5]\d$/.test(String(raw?.departureTime || ''))) {
+    proposed.departureTime = String(raw.departureTime);
+  }
+
+  // Only real parameters survive: `current` arrives as plan.params, which also
+  // carries display labels that must never be sent back as settings.
+  const base = {};
+  for (const key of Object.keys(ROUTE_DEFAULTS)) {
+    base[key] = current[key] !== undefined ? current[key] : ROUTE_DEFAULTS[key];
+  }
+
+  const settings = { ...base, ...proposed };
+
+  // Only report fields that actually differ from what is on screen now.
+  const changes = Object.keys(proposed)
+    .filter((key) => proposed[key] !== current[key])
+    .map((key) => ({
+      key,
+      label: SETTING_LABELS[key] || key,
+      from: current[key],
+      to: proposed[key],
+    }));
+
+  return { settings, changes };
+}
+
+function percentSaved(baselineValue, optimisedValue) {
+  if (!baselineValue || baselineValue <= 0) return 0;
+  return Math.round(((baselineValue - optimisedValue) / baselineValue) * 100);
 }
