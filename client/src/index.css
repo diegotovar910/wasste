@@ -1,0 +1,147 @@
+@import 'tailwindcss';
+
+/*
+ * Wasste design tokens.
+ *
+ * The four category colours are not decoration: they were validated with the
+ * data-viz palette checker for colour-vision deficiency separation, lightness
+ * band, chroma and contrast in BOTH light and dark mode, on the surfaces below.
+ * They must always be rendered in this fixed order - landfill, paper,
+ * containers, organics - because that ordering is what keeps every adjacent
+ * pair distinguishable. Do not re-order or sort series by value.
+ */
+
+:root {
+  color-scheme: light;
+
+  --surface-1: #fcfcfb; /* cards and chart surface */
+  --surface-2: #f9f9f7; /* page plane */
+  --surface-3: #f1f1ed; /* insets, tracks, subtle fills */
+
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+
+  --border-hairline: rgb(11 11 11 / 0.1);
+  --grid-line: #e1e0d9;
+  --axis-line: #c3c2b7;
+
+  --cat-landfill: #eb6834;
+  --cat-paper: #2a78d6;
+  --cat-containers: #eda100;
+  --cat-organics: #1baf7a;
+
+  --status-good: #0ca30c;
+  --status-warning: #fab219;
+  --status-serious: #ec835a;
+  --status-critical: #d03b3b;
+  --status-offline: #898781;
+
+  --delta-positive: #006300;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme='light']) {
+    color-scheme: dark;
+
+    --surface-1: #1a1a19;
+    --surface-2: #0d0d0d;
+    --surface-3: #232322;
+
+    --text-primary: #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted: #898781;
+
+    --border-hairline: rgb(255 255 255 / 0.1);
+    --grid-line: #2c2c2a;
+    --axis-line: #383835;
+
+    --cat-landfill: #d95926;
+    --cat-paper: #3987e5;
+    --cat-containers: #c98500;
+    --cat-organics: #199e70;
+
+    --delta-positive: #0ca30c;
+  }
+}
+
+:root[data-theme='dark'] {
+  color-scheme: dark;
+
+  --surface-1: #1a1a19;
+  --surface-2: #0d0d0d;
+  --surface-3: #232322;
+
+  --text-primary: #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted: #898781;
+
+  --border-hairline: rgb(255 255 255 / 0.1);
+  --grid-line: #2c2c2a;
+  --axis-line: #383835;
+
+  --cat-landfill: #d95926;
+  --cat-paper: #3987e5;
+  --cat-containers: #c98500;
+  --cat-organics: #199e70;
+
+  --delta-positive: #0ca30c;
+}
+
+/* `inline` keeps the utilities pointing at the variables above, so a theme
+   change swaps every colour without regenerating classes. */
+@theme inline {
+  --color-surface: var(--surface-1);
+  --color-plane: var(--surface-2);
+  --color-inset: var(--surface-3);
+
+  --color-ink: var(--text-primary);
+  --color-ink-secondary: var(--text-secondary);
+  --color-ink-muted: var(--text-muted);
+
+  --color-hairline: var(--border-hairline);
+  --color-grid: var(--grid-line);
+  --color-axis: var(--axis-line);
+
+  --color-landfill: var(--cat-landfill);
+  --color-paper: var(--cat-paper);
+  --color-containers: var(--cat-containers);
+  --color-organics: var(--cat-organics);
+
+  --color-good: var(--status-good);
+  --color-warning: var(--status-warning);
+  --color-serious: var(--status-serious);
+  --color-critical: var(--status-critical);
+  --color-offline: var(--status-offline);
+
+  --font-sans: system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  background-color: var(--surface-2);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Recharts draws focus outlines on its wrapper; keep keyboard focus visible
+   only where we actually handle it. */
+.recharts-wrapper:focus,
+.recharts-surface:focus {
+  outline: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}
