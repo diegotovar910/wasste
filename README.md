@@ -40,6 +40,7 @@ RECOGNISE → CLASSIFY → COLLECT DATA → ANALYSE → IDENTIFY OPPORTUNITIES �
 |---|---|---|
 | City overview | `/` | Network-wide metrics, waste trend, distribution, schematic bin map, collection queue, city-level AI analysis, all bins |
 | Waste scanner | `/scan` | Upload or photograph an item, classify it with Gemini Vision, record it against a bin |
+| Collection route | `/routes` | Today's optimised round built from live fill levels, with time, fuel and CO₂ saved against a fixed round, plus an AI dispatch briefing |
 | Analytics | `/analytics` | Waste over time, waste by category, distribution, bin fill levels, landfill diversion, top locations, data table |
 | Bin detail | `/bins/:id` | One bin's fill level, sensors, distribution, history, recent items, and its own AI recommendations |
 
@@ -238,6 +239,21 @@ REASON      the resulting briefing goes to Gemini with a schema-constrained prom
 RECOMMEND   summary, key finding, 2–4 prioritised actions, resource-recovery opportunities
 ```
 
+### 3. Route optimisation — solve, then explain
+
+`server/src/services/routeService.js` contains no AI at all. It selects the bins that have earned a
+stop, orders them with **nearest-neighbour plus a 2-opt improvement pass** (which untangles the
+crossings a greedy route leaves behind), and costs the round: distance, drive time, servicing time,
+diesel and CO₂. The saving is measured against the status quo it replaces — a fixed round that
+drives to every bin regardless of how full it is.
+
+Only then does Gemini see the finished plan, and its job is to brief the depot supervisor: why this
+sequence, why those bins were skipped (justified by each one's days-until-full), and what the crew
+should watch for. It is explicitly told never to invent a distance or an emission figure.
+
+A bin at 90% or above is always collected, whatever the threshold — it is about to overflow. So is a
+bin whose sensor is offline, because its real level is unknown and a truck has to go and look.
+
 ### The division of labour
 
 ```
@@ -297,6 +313,13 @@ Base URL `http://localhost:5000/api`.
 | `POST` | `/waste/classify` | `multipart/form-data`: `image` (≤5 MB), optional `binId`, optional `record` |
 | `GET` | `/waste/events?binId=&category=&limit=` | Event log |
 | `GET` | `/waste/stats?binId=&days=` | Category totals, time series and impact |
+
+### Routes
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/routes/optimize?fillThreshold=70` | Solved collection round. No AI, so it returns instantly |
+| `POST` | `/routes/analyze` | The same plan plus Gemini's dispatch briefing |
 
 ### AI
 

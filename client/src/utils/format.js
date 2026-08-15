@@ -20,6 +20,19 @@ export function formatCompact(value) {
   return formatNumber(number, Number.isInteger(number) ? 0 : 1);
 }
 
+/** 176 -> "2 h 56 min". Used for route durations. */
+export function formatDuration(minutes) {
+  const total = Math.max(0, Math.round(Number(minutes) || 0));
+  const hours = Math.floor(total / 60);
+  const rest = total % 60;
+
+  if (!hours) return `${rest} min`;
+  if (!rest) return `${hours} h`;
+  return `${hours} h ${rest} min`;
+}
+
+export const formatKm = (value, decimals = 1) => `${formatNumber(value, decimals)} km`;
+
 export function formatDate(value, options = { month: 'short', day: 'numeric' }) {
   if (!value) return '--';
   return new Date(value).toLocaleDateString('en-CA', options);

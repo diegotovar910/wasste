@@ -69,6 +69,13 @@ export const api = {
     return request('/waste/classify', { method: 'POST', body: form, isFormData: true });
   },
 
+  /** Deterministic collection route - no AI, so it loads instantly. */
+  optimizeRoute: (fillThreshold = 70, signal) =>
+    request(`/routes/optimize?fillThreshold=${fillThreshold}`, { signal }),
+  /** The same route plus Gemini's dispatch briefing. */
+  analyseRoute: (fillThreshold = 70) =>
+    request('/routes/analyze', { method: 'POST', body: { fillThreshold } }),
+
   analyse: ({ binId, days = 30 } = {}) => request('/ai/analyze', { method: 'POST', body: { binId, days } }),
   recommendations: (binId, days = 30, signal) =>
     request(`/ai/recommendations/${binId}?days=${days}`, { signal }),

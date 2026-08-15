@@ -3,7 +3,15 @@ import { CATEGORIES, UNKNOWN } from '../config/wasteCategories.js';
 import { extractJson } from '../utils/json.js';
 
 const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
-const REQUEST_TIMEOUT_MS = 25_000;
+/**
+ * Timeouts are per call type, because the two jobs are not alike.
+ * Classifying one photo comes back in a few seconds; the reasoning passes send
+ * a large briefing and spend time thinking before they answer, and measured
+ * around 18s. A single shared timeout either cuts off real work or waits far
+ * too long on a saturated model.
+ */
+const VISION_TIMEOUT_MS = 15_000;
+const REASONING_TIMEOUT_MS = 35_000;
 
 /** Gemini returns 429/503 under load; a couple of quick retries ride that out. */
 const RETRYABLE_STATUSES = [429, 500, 502, 503, 504];
@@ -47,8 +55,9 @@ async function generateContent(options) {
         lastError = error;
 
         // A non-retryable failure (404 retired model, 400 bad request) will not
-        // improve by waiting, so move straight on to the next model.
-        if (!error.retryable) break;
+        // improve by waiting. Neither will a timeout: the same model is about
+        // to spend the same 12s again. Both go straight to the next model.
+        if (!error.retryable || error.timedOut) break;
 
         if (attempt < ATTEMPTS_PER_MODEL) {
           const delay = RETRY_BASE_DELAY_MS * 2 ** (attempt - 1);
@@ -73,9 +82,10 @@ async function requestOnce({
   responseSchema,
   temperature = 0.2,
   maxOutputTokens = 1024,
+  timeoutMs = REASONING_TIMEOUT_MS,
 }) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
 
   try {
     const response = await fetch(`${API_BASE}/${model}:generateContent`, {
@@ -121,11 +131,10 @@ async function requestOnce({
   } catch (error) {
     if (error instanceof GeminiUnavailableError) throw error;
 
-    // Timeouts and transport failures are both worth one more attempt.
-    const failure = new GeminiUnavailableError(
-      error.name === 'AbortError' ? 'Gemini timed out.' : error.message,
-    );
+    const timedOut = error.name === 'AbortError';
+    const failure = new GeminiUnavailableError(timedOut ? 'Gemini timed out.' : error.message);
     failure.retryable = true;
+    failure.timedOut = timedOut;
     throw failure;
   } finally {
     clearTimeout(timeout);
@@ -172,6 +181,7 @@ export async function classifyWasteImage({ buffer, mimeType }) {
     responseSchema: CLASSIFICATION_SCHEMA,
     temperature: 0.1,
     maxOutputTokens: 512,
+    timeoutMs: VISION_TIMEOUT_MS,
   });
 }
 
@@ -208,6 +218,55 @@ const AGENT_SCHEMA = {
   },
   required: ['summary', 'keyFinding', 'recommendations', 'resourceRecovery'],
 };
+
+const ROUTE_SYSTEM_PROMPT = `You are the collection-operations analyst for Wasste, a network of sensor-equipped public waste bins.
+
+You receive a collection round that has ALREADY been solved and costed by the backend: which bins are on it, in what order, the distance, the time, the fuel and the emissions, plus the bins that were skipped and how many days each has before it fills up.
+
+Your job is to brief the depot supervisor. You must:
+- Explain in plain operational language why this round makes sense, referring to the actual bins by name and their actual fill levels.
+- Justify the skipped bins using their days-until-full figure, and warn if any of them is close enough to need a stop tomorrow.
+- Flag genuine operational risks: bins with no sensor data, bins already at 100%, a round that looks too long for one shift.
+- Give 2 to 4 concrete actions for the supervisor, most important first.
+- Never invent distances, times or emissions. Quote the figures you were given.
+- Never claim the route is mathematically optimal; it is a good heuristic solution.`;
+
+const ROUTE_SCHEMA = {
+  type: 'OBJECT',
+  properties: {
+    summary: { type: 'STRING' },
+    sequenceRationale: { type: 'STRING' },
+    recommendations: {
+      type: 'ARRAY',
+      items: {
+        type: 'OBJECT',
+        properties: {
+          title: { type: 'STRING' },
+          description: { type: 'STRING' },
+          priority: { type: 'STRING', enum: ['HIGH', 'MEDIUM', 'LOW'] },
+        },
+        required: ['title', 'description', 'priority'],
+      },
+    },
+    risks: { type: 'ARRAY', items: { type: 'STRING' } },
+  },
+  required: ['summary', 'sequenceRationale', 'recommendations', 'risks'],
+};
+
+/** Reasoning pass over a route the backend has already solved. */
+export async function generateRouteAnalysis(briefing) {
+  return generateContent({
+    systemInstruction: ROUTE_SYSTEM_PROMPT,
+    parts: [
+      {
+        text: `Brief the supervisor on this collection round.\n\n${JSON.stringify(briefing, null, 2)}`,
+      },
+    ],
+    responseSchema: ROUTE_SCHEMA,
+    temperature: 0.4,
+    maxOutputTokens: 6144,
+  });
+}
 
 /**
  * Reasoning pass. The briefing is already-computed backend data; Gemini only

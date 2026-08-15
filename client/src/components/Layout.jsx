@@ -6,6 +6,7 @@ import { ThemeToggle } from './ThemeToggle.jsx';
 const NAV_ITEMS = [
   { to: '/', label: 'City overview', end: true },
   { to: '/scan', label: 'Waste scanner' },
+  { to: '/routes', label: 'Collection route' },
   { to: '/analytics', label: 'Analytics' },
 ];
 

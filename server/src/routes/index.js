@@ -8,6 +8,7 @@ import { getDashboard } from '../controllers/dashboardController.js';
 import binRoutes from './binRoutes.js';
 import wasteRoutes from './wasteRoutes.js';
 import aiRoutes from './aiRoutes.js';
+import routeRoutes from './routeRoutes.js';
 
 const router = Router();
 
@@ -37,5 +38,6 @@ router.get('/dashboard', asyncHandler(getDashboard));
 router.use('/bins', binRoutes);
 router.use('/waste', wasteRoutes);
 router.use('/ai', aiRoutes);
+router.use('/routes', routeRoutes);
 
 export default router;
